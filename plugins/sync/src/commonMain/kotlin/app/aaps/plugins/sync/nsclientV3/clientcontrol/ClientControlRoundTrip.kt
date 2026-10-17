@@ -230,11 +230,23 @@ class ClientControlRoundTrip(
                 armProgressWatchdog()
             }
 
+            // Defensive: if StateFlow conflation on the master side dropped the initial Active frame and
+            // we only ever see the terminal Complete/Cleared, our state is still null. completeAndAutoClear()
+            // and clear() on a null state are both no-ops, so the progress dialog would never light up.
+            // Synthesize a start here so the terminal frame actually updates something visible.
             ProgressPhase.Complete -> {
+                if (bolusProgressData.state.value == null) {
+                    bolusProgressData.start(env.insulin, isSMB = false)
+                    bolusProgressData.updateProgress(env.percent, TextRef.Literal(env.status), PumpInsulin(env.delivered))
+                }
                 cancelProgressWatchdog(); bolusProgressData.completeAndAutoClear()
             }
 
             ProgressPhase.Cleared  -> {
+                if (bolusProgressData.state.value == null) {
+                    bolusProgressData.start(env.insulin, isSMB = false)
+                    bolusProgressData.updateProgress(env.percent, TextRef.Literal(env.status), PumpInsulin(env.delivered))
+                }
                 cancelProgressWatchdog(); bolusProgressData.clear()
             }
         }

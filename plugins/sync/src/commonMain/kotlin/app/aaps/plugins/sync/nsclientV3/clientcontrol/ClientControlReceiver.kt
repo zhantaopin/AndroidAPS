@@ -186,6 +186,15 @@ class ClientControlReceiver(
                         }
 
                         st != null && st.percent >= 100 -> { // delivered
+                            // StateFlow is conflated: if start() and complete() happen in the same coroutine
+                            // dispatch, we may only see percent=100 and miss the initial percent=0 frame entirely.
+                            // The client needs an Active frame to start() its local state — otherwise Complete
+                            // on a null state is a no-op and the progress dialog never lights up. Emit a
+                            // synthetic Active here if we haven't streamed any intermediate frame yet.
+                            if (!progressDelivering) {
+                                writeProgress(clientId, ProgressPhase.Active, st)
+                                progressDelivering = true
+                            }
                             writeProgress(clientId, ProgressPhase.Complete, st)
                             progressClientId.store(null)
                             progressDelivering = false
