@@ -150,6 +150,11 @@ class ClientControlReceiver(
     private val progressSampleMs = 1_000L
     private val progressArmTtlMs = 60_000L
 
+    // Progress write retry: NS WS can momentarily drop while pump drivers (Medtrum) re-establish BLE on bolus
+    // start. Three retries with linear backoff (~3.5s total budget) lets BLE + WS stabilize before giving up.
+    private val PROGRESS_WRITE_RETRIES = 4
+    private val PROGRESS_WRITE_BASE_BACKOFF_MS = 500L
+
     // Liveness heartbeat: some pump drivers (Medtronic, Omnipod Eros) deliver a bolus as one blocking call and
     // emit NO intermediate progress. Re-publishing the current frame on this cadence keeps the client's stall
     // watchdog from false-firing on a healthy long bolus; only a real relay/connection outage produces silence.
@@ -864,11 +869,14 @@ class ClientControlReceiver(
 
     /**
      * Write one throttled bolus-progress frame to the armed client's per-client doc (overwritten in place). Signed
-     * with the shared secret so a forged "delivered" is no more believable than a forged ack. Best-effort — a dropped
-     * frame just means a momentarily stale bar on the client; the next frame (or the terminal) corrects it.
+     * with the shared secret so a forged "delivered" is no more believable than a forged ack.
+     *
+     * Retries up to [PROGRESS_WRITE_RETRIES] times when NS is momentarily unavailable. Pump drivers like Medtrum
+     * re-establish BLE when starting a bolus — the NS WS can briefly drop during that window, and dropping the
+     * *first* Active frame means the client never start()s its local BolusProgressData and the progress dialog
+     * stays hidden for the whole delivery. [PROGRESS_WRITE_BASE_BACKOFF_MS] gives BLE + WS a moment to recover.
      */
     private suspend fun writeProgress(clientId: String, phase: ProgressPhase, st: BolusProgressState) {
-        val client = nsClientV3Plugin().nsAndroidClient ?: return
         val secret = authorizedRepository.secretLookup(clientId)?.secretBytes ?: return
         val env = ClientControlCrypto.signProgress(
             secret,
@@ -885,8 +893,18 @@ class ClientControlReceiver(
             put("schemaVersion", ClientControlPublisher.SCHEMA_VERSION)
             put("progress", json.encodeToJsonElement(ProgressEnvelope.serializer(), env))
         }
-        runCatching { client.updateSettings(identifier, doc) }
-            .onFailure { aapsLogger.error(LTag.NSCLIENT, "ClientControl: progress write failed for $identifier: ${it.message}") }
+        repeat(PROGRESS_WRITE_RETRIES) { attempt ->
+            val client = nsClientV3Plugin().nsAndroidClient
+            if (client != null) {
+                val result = runCatching { client.updateSettings(identifier, doc) }
+                if (result.isSuccess) return
+                aapsLogger.warn(LTag.NSCLIENT, "ClientControl: progress write failed for $identifier (attempt ${attempt + 1}/$PROGRESS_WRITE_RETRIES): ${result.exceptionOrNull()?.message}")
+            } else {
+                aapsLogger.warn(LTag.NSCLIENT, "ClientControl: nsAndroidClient null, deferring progress write for $identifier (attempt ${attempt + 1}/$PROGRESS_WRITE_RETRIES)")
+            }
+            if (attempt < PROGRESS_WRITE_RETRIES - 1) delay(PROGRESS_WRITE_BASE_BACKOFF_MS * (attempt + 1))
+        }
+        aapsLogger.error(LTag.NSCLIENT, "ClientControl: progress write exhausted retries for $identifier — client will miss frame")
     }
 
     /** Result a command handler reports back so [verifyAndAck] can write the terminal Done ack. */
