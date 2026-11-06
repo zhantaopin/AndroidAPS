@@ -8,11 +8,33 @@ name: iOS unsigned IPA
 #   - 不走 xcodebuild -exportArchive，因为它即使禁用签名也要求非空的 team id 和 profile
 #   - IPA 就是 Payload/<App>.app 的 zip，直接用 ditto 打
 #
+# 两个刻意为之的选择：
+#   1. macos-15-intel：标准 arm64 runner 只有 3 vCPU / 7 GB，release 链接阶段会撞 swap。
+#      Intel 标准 runner 是 4 vCPU / 14 GB，内存翻倍，链接不再换页。
+#      （macos-13 已于 2025-12-04 退役，Intel 的标准位就是 macos-15-intel。）
+#   2. 默认 Debug：未签名包用于侧载，Debug 与 Release 功能完全一致，只是未优化、包更大，
+#      但链接时间只有 Release 的零头。需要 Release 时手动 dispatch 并选 release。
+#
 # Kotlin 链接被单独提成一个 step：它在 Xcode 构建脚本里跑时没有任何输出，卡住时无法
 # 分辨「在链接」还是「内存交换」。单独跑之后，每个 `> Task` 都会实时出现在日志里。
 
 on:
   workflow_dispatch:
+    inputs:
+      scheme:
+        description: 'Xcode scheme'
+        default: AAPSClient
+        type: choice
+        options: [AAPSClient, AAPSClient2]
+      configuration:
+        description: 'Build configuration'
+        default: Debug
+        type: choice
+        options: [Debug, Release]
+      runs_on:
+        description: 'Runner label'
+        default: macos-15-intel
+        type: string
   push:
     paths:
       - 'ios/**'
@@ -34,22 +56,24 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CONFIG: ${{ inputs.configuration || 'Debug' }}
+  SCHEME: ${{ inputs.scheme || 'AAPSClient' }}
   # release 链接的峰值内存超过 runner 的默认堆上限，先撞上的是 swap 而不是 CPU。
-  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dkotlin.daemon.jvm.options=-Xmx3g"
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx6g -Dkotlin.daemon.jvm.options=-Xmx4g"
 
 jobs:
   ipa:
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runs_on || 'macos-15-intel' }}
     timeout-minutes: 100
 
-    strategy:
-      fail-fast: false
-      matrix:
-        # AAPSClient2 先不跑：两个 scheme 各自完整编译一遍 Kotlin/Native，
-        # 翻倍耗时且互不共享产物。需要时在这里加回来。
-        scheme: [AAPSClient]
-
     steps:
+      - name: Show environment
+        run: |
+          echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
+          sysctl -n hw.ncpu hw.memsize | awk 'NR==1{print "cpus: "$1} NR==2{print "ram: "$1/1024/1024/1024" GB"}'
+          sw_vers
+          xcodebuild -version
+
       - uses: actions/checkout@v5
         with:
           # About 里的 build stamp 来自 git describe，浅克隆没有 tag 可用。
@@ -71,18 +95,20 @@ jobs:
       # 不一定登记到那里，缺了就补一个链接。
       - name: Make JDK visible to java_home
         run: |
-          if ! /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
+          if ! /usr/libexec/java_home -v "$JAVA_VERSION" >/dev/null 2>&1; then
             sudo ln -sfn "$JAVA_HOME" "/Library/Java/JavaVirtualMachines/$(basename "$JAVA_HOME")"
           fi
-          /usr/libexec/java_home -v 21
+          /usr/libexec/java_home -v "$JAVA_VERSION"
 
       # Kotlin/Native 的编译器与预编译库约 1GB，缓存掉首次下载。
       - name: Cache Kotlin/Native
         uses: actions/cache@v4
         with:
           path: ~/.konan
-          key: konan-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml') }}
-          restore-keys: konan-${{ runner.os }}-
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+            konan-${{ runner.os }}-
 
       # 写入 AAPS_MARKETING_VERSION / AAPS_BUILD_NUMBER，供 Info.plist 使用。
       - name: Generate the version numbers
@@ -103,20 +129,24 @@ jobs:
 
       # 这一步原本藏在 Xcode 的 Run Script 构建阶段里，现在单独跑，进度可见。
       # 之后 archive 时该任务已经是 up-to-date，Xcode 阶段只剩几十秒。
-      - name: Link Kotlin framework (Release, device)
+      - name: Link Kotlin framework (${{ env.CONFIG }}, device)
         run: |
           set -o pipefail
-          ./gradlew --console=plain --no-daemon --stacktrace \
-            :ios:shell:linkReleaseFrameworkIosArm64 | tee link.log
+          case "$CONFIG" in
+            Debug)   TASK=:ios:shell:linkDebugFrameworkIosArm64 ;;
+            Release) TASK=:ios:shell:linkReleaseFrameworkIosArm64 ;;
+          esac
+          echo "task: $TASK"
+          ./gradlew --console=plain --no-daemon --stacktrace "$TASK" | tee link.log
 
-      - name: Archive (Release, unsigned)
+      - name: Archive (${{ env.CONFIG }}, unsigned)
         run: |
           set -o pipefail
           xcodebuild -project ios/app/AAPSClient.xcodeproj \
-            -scheme ${{ matrix.scheme }} \
-            -configuration Release \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIG" \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive" \
+            -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY= \
@@ -128,7 +158,7 @@ jobs:
       - name: Package unsigned IPA
         run: |
           set -o pipefail
-          APP_DIR=$(find "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive/Products" -name '*.app' -type d -print -quit)
+          APP_DIR=$(find "$RUNNER_TEMP/$SCHEME.xcarchive/Products" -name '*.app' -type d -print -quit)
           if [ -z "$APP_DIR" ]; then
             echo "::error::No .app found inside the xcarchive"
             exit 1
@@ -138,7 +168,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$APP_DIR" "$RUNNER_TEMP/Payload/"
 
-          IPA="$RUNNER_TEMP/${{ matrix.scheme }}.ipa"
+          IPA="$RUNNER_TEMP/$SCHEME.ipa"
           # ditto 比 zip -r 更能保留符号链接和扩展属性
           ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Payload" "$IPA"
           rm -rf "$RUNNER_TEMP/Payload"
@@ -147,7 +177,7 @@ jobs:
       # 侧载工具期待二进制里没有内嵌签名；这里只做提示，不阻断。
       - name: Report signature state
         run: |
-          APP_DIR=$(find "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive/Products" -name '*.app' -type d -print -quit)
+          APP_DIR=$(find "$RUNNER_TEMP/$SCHEME.xcarchive/Products" -name '*.app' -type d -print -quit)
           if codesign -dv "$APP_DIR" >/dev/null 2>&1; then
             echo "::warning::The app still carries a signature; sideloaders will strip it anyway."
           else
@@ -157,8 +187,8 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.scheme }}-unsigned-ipa
-          path: ${{ runner.temp }}/${{ matrix.scheme }}.ipa
+          name: ${{ env.SCHEME }}-${{ env.CONFIG }}-unsigned-ipa
+          path: ${{ runner.temp }}/${{ env.SCHEME }}.ipa
           if-no-files-found: error
           retention-days: 30
 
@@ -166,7 +196,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.scheme }}-build-log
+          name: ${{ env.SCHEME }}-${{ env.CONFIG }}-build-log
           path: |
             link.log
             archive.log
