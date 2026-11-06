@@ -178,6 +178,11 @@ kotlin {
             // reports an unresolved symbol as a build error instead of deferring it to app start.
             isStatic = true
 
+            // DevirtualizationAnalysis 在 27 模块 + Compose 的大项目上，Release LTO 建约束图时
+            // 会 OOM（LongArrayList 在 ConstraintGraphBuilder.addEdge 爆）。关掉后体积略大、
+            // 启动稍慢，但 CI 能稳过。Debug 本来就不跑 LTO，不受影响。
+            compilerOptions { freeCompilerArgs.add("-Xdevirtualization=off") }
+
             if (exportMigratedApi) {
                 migratedModules.forEach { export(project.dependencies.project(it)) }
             }

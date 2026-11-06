@@ -59,7 +59,8 @@ env:
   CONFIG: ${{ inputs.configuration || 'Debug' }}
   SCHEME: ${{ inputs.scheme || 'AAPSClient' }}
   # release 链接的峰值内存超过 runner 的默认堆上限，先撞上的是 swap 而不是 CPU。
-  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx6g -Dkotlin.daemon.jvm.options=-Xmx4g"
+  # 14GB Intel runner：Gradle daemon 拿 8g，K/N daemon 拿 6g，macOS 自身 + Xcode 约 2-3g。
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx8g -Dkotlin.daemon.jvm.options=-Xmx6g"
 
 jobs:
   ipa:
