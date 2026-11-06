@@ -1,0 +1,158 @@
+name: iOS unsigned IPA
+
+# 在 GitHub 的 macOS runner 上产出未签名 IPA：不需要 Apple Developer 账号、证书或描述文件。
+# 产物下载后用 AltStore / Sideloadly / TrollStore 在手机上重签安装。
+#
+# 流程和官方 ios-testflight.yml 相同，只把签名与上传换成「关掉签名 + 手动打 Payload 包」：
+#   - CODE_SIGNING_ALLOWED=NO 让 Xcode 完全跳过 CodeSign 阶段
+#   - 不走 xcodebuild -exportArchive，因为它即使禁用签名也要求非空的 team id 和 profile
+#   - IPA 就是 Payload/<App>.app 的 zip，直接用 ditto 打
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - 'shared/**'
+      - 'core/**'
+      - 'database/**'
+      - 'plugins/**'
+      - 'implementation/**'
+      - 'ui/**'
+      - 'buildSrc/**'
+      - 'gradle/libs.versions.toml'
+      - '.github/workflows/ios-unsigned-ipa.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 120
+
+    strategy:
+      # 两个 scheme 是两个独立的 App（app.aaps.client / app.aaps.client2），
+      # 一个失败不该拖垮另一个。
+      fail-fast: false
+      matrix:
+        scheme: [AAPSClient, AAPSClient2]
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # About 里的 build stamp 来自 git describe，浅克隆没有 tag 可用。
+          fetch-depth: 0
+
+      - name: Load jdk version
+        run: |
+          JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
+          echo "JAVA_VERSION=$JAVA_VERSION" >> "$GITHUB_ENV"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      # Xcode 的构建脚本用 /usr/libexec/java_home -v 21 找 JDK；setup-java 装的 JDK
+      # 不一定登记到那里，缺了就补一个链接。
+      - name: Make JDK visible to java_home
+        run: |
+          if ! /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
+            sudo ln -sfn "$JAVA_HOME" "/Library/Java/JavaVirtualMachines/$(basename "$JAVA_HOME")"
+          fi
+          /usr/libexec/java_home -v 21
+
+      # Kotlin/Native 的编译器与预编译库有 1GB 上下，缓存掉首次的下载与链接。
+      - name: Cache Kotlin/Native
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ runner.os }}-
+
+      # 写入 AAPS_MARKETING_VERSION / AAPS_BUILD_NUMBER，供 Info.plist 使用。
+      - name: Generate the version numbers
+        run: ./gradlew --console=plain --no-daemon :ios:shell:generateIosVersionXcconfig
+
+      # Signing.xcconfig 里有 `#include? "Signing.local.xcconfig"`，这里把它写成空团队，
+      # 再把签名相关设置整体关掉。
+      - name: Disable signing
+        run: |
+          cat > ios/app/Signing.local.xcconfig <<EOF
+          DEVELOPMENT_TEAM =
+          CODE_SIGN_STYLE = Manual
+          CODE_SIGN_IDENTITY =
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGNING_ALLOWED = NO
+          EOF
+          cat ios/app/Signing.local.xcconfig
+
+      # Release 配置会先跑 ./gradlew :ios:shell:linkReleaseFrameworkIosArm64（Xcode 构建脚本），
+      # 再把 AapsShared.framework 链进 App，因此不需要单独预热 Gradle。
+      - name: Archive (Release, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project ios/app/AAPSClient.xcodeproj \
+            -scheme ${{ matrix.scheme }} \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            ONLY_ACTIVE_ARCH=NO \
+            archive | tee archive.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -o pipefail
+          APP_DIR=$(find "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive/Products" -name '*.app' -type d -print -quit)
+          if [ -z "$APP_DIR" ]; then
+            echo "::error::No .app found inside the xcarchive"
+            exit 1
+          fi
+          echo "Found app: $APP_DIR"
+
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP_DIR" "$RUNNER_TEMP/Payload/"
+
+          IPA="$RUNNER_TEMP/${{ matrix.scheme }}.ipa"
+          # ditto 比 zip -r 更能保留符号链接和扩展属性
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Payload" "$IPA"
+          rm -rf "$RUNNER_TEMP/Payload"
+          echo "IPA: $IPA ($(du -h "$IPA" | cut -f1))"
+
+      # 侧载工具期待二进制里没有内嵌签名；这里只做提示，不阻断。
+      - name: Report signature state
+        run: |
+          APP_DIR=$(find "$RUNNER_TEMP/${{ matrix.scheme }}.xcarchive/Products" -name '*.app' -type d -print -quit)
+          if codesign -dv "$APP_DIR" >/dev/null 2>&1; then
+            echo "::warning::The app still carries a signature; sideloaders will strip it anyway."
+          else
+            echo "The app is unsigned, as expected."
+          fi
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.scheme }}-unsigned-ipa
+          path: ${{ runner.temp }}/${{ matrix.scheme }}.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Keep the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.scheme }}-build-log
+          path: archive.log
+          retention-days: 7
